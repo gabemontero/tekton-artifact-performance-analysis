@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,7 @@ func main() {
 	tapa.AddCommand(ParsePipelineRunList())
 	tapa.AddCommand(ParseTaskRunList())
 	tapa.AddCommand(ParsePodList())
+	tapa.AddCommand(ParseAllThreeLists())
 	if err := tapa.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "tapa encountered the following error: %s\n", err.Error())
 		os.Exit(1)
@@ -182,7 +184,7 @@ func ParseTaskRunList() *cobra.Command {
 				return
 			}
 
-			prToDuration := map[string]float64{}
+			trToDuration := map[string]float64{}
 			durations := []float64{}
 			durationsMap := map[float64]struct{}{}
 			for _, tr := range trList.Items {
@@ -197,7 +199,7 @@ func ParseTaskRunList() *cobra.Command {
 				}
 
 				duration := tr.Status.CompletionTime.Sub(tr.Status.StartTime.Time)
-				prToDuration[fmt.Sprintf("%s:%s", tr.Namespace, tr.Name)] = duration.Seconds()
+				trToDuration[fmt.Sprintf("%s:%s", tr.Namespace, tr.Name)] = duration.Seconds()
 				_, ok := durationsMap[duration.Seconds()]
 				if !ok {
 					durations = append(durations, duration.Seconds())
@@ -206,7 +208,7 @@ func ParseTaskRunList() *cobra.Command {
 			}
 			sort.Float64s(durations)
 			for _, duration := range durations {
-				for key, value := range prToDuration {
+				for key, value := range trToDuration {
 					if value == duration {
 						fmt.Fprintf(os.Stdout, "TaskRun %s\t\ttook %v seconds\n", key, value)
 					}
@@ -215,4 +217,147 @@ func ParseTaskRunList() *cobra.Command {
 		},
 	}
 	return parseTRList
+}
+
+func ParseAllThreeLists() *cobra.Command {
+	allList := &cobra.Command{
+		Use:   "all <pr file location> <tr file location> <pod file location> [<options>]",
+		Short: "Parse a list of PipelineRuns, their TaskRuns, and their Pods, for various statistics",
+		Long:  "Parse a list of PipelineRuns, their TaskRuns, and their Pods, for various statistics",
+		Example: `
+`,
+		Run: func(cmd *cobra.Command, args []string) {
+			if len(args) < 3 {
+				fmt.Fprintf(os.Stderr, "ERROR: not enough arguments: %s\n", cmd.Use)
+				return
+			}
+			prFileName := args[0]
+			prBuf, perr := os.ReadFile(prFileName)
+			if perr != nil {
+
+			}
+			trFileName := args[1]
+			trBuf, terr := os.ReadFile(trFileName)
+			if terr != nil {
+
+			}
+			podFileName := args[2]
+			podBuf, pderr := os.ReadFile(podFileName)
+			if pderr != nil {
+
+			}
+
+			prList := &v1beta1.PipelineRunList{}
+			perr = json.Unmarshal(prBuf, prList)
+			if perr != nil {
+
+			}
+			trList := &v1beta1.TaskRunList{}
+			terr = json.Unmarshal(trBuf, trList)
+			if terr != nil {
+
+			}
+			podList := &corev1.PodList{}
+			pderr = json.Unmarshal(podBuf, podList)
+			if pderr != nil {
+
+			}
+
+			prToDuration := map[string]float64{}
+			prToTaskDurations := map[string]float64{}
+			prToPodDurations := map[string]float64{}
+			prDurations := []float64{}
+			prDurationsMap := map[float64]struct{}{}
+			for _, pr := range prList.Items {
+				if !pr.HasStarted() {
+					//TODO track not started
+					continue
+				}
+
+				if !pr.IsDone() {
+					// TODO track not completed
+					continue
+				}
+
+				prKey := fmt.Sprintf("%s:%s", pr.Namespace, pr.Name)
+				duration := pr.Status.CompletionTime.Sub(pr.Status.StartTime.Time)
+				prToDuration[prKey] = duration.Seconds()
+				_, ok := prDurationsMap[duration.Seconds()]
+				if !ok {
+					prDurations = append(prDurations, duration.Seconds())
+					prDurationsMap[duration.Seconds()] = struct{}{}
+				}
+				for _, tr := range trList.Items {
+					if tr.Namespace != pr.Namespace {
+						continue
+					}
+					if !strings.HasPrefix(tr.Name, pr.Name) {
+						continue
+					}
+					if !tr.HasStarted() {
+						//TODO track not startedss
+						continue
+					}
+
+					if !tr.IsDone() {
+						// TODO track not completed
+						continue
+					}
+
+					duration = tr.Status.CompletionTime.Sub(tr.Status.StartTime.Time)
+					taskDurations := float64(0)
+					taskDurations, ok = prToTaskDurations[prKey]
+					if !ok {
+						taskDurations = duration.Seconds()
+					} else {
+						taskDurations = taskDurations + duration.Seconds()
+					}
+					prToTaskDurations[prKey] = taskDurations
+					for _, pod := range podList.Items {
+						if pod.Namespace != tr.Namespace {
+							continue
+						}
+						if !strings.HasPrefix(pod.Name, tr.Name) {
+							continue
+						}
+						if pod.Status.StartTime == nil {
+							//TODO track not started
+							continue
+						}
+
+						if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+							//TODO track still in progress
+							continue
+						}
+						for _, status := range pod.Status.ContainerStatuses {
+							terminated := status.State.Terminated
+							if terminated != nil {
+								duration = terminated.FinishedAt.Sub(pod.Status.StartTime.Time)
+							}
+						}
+						podDurations := float64(0)
+						podDurations, ok = prToPodDurations[prKey]
+						if !ok {
+							podDurations = duration.Seconds()
+						} else {
+							podDurations = podDurations + duration.Seconds()
+						}
+						prToPodDurations[prKey] = podDurations
+					}
+				}
+			}
+			sort.Float64s(prDurations)
+			for _, duration := range prDurations {
+				for key, value := range prToDuration {
+					if value == duration {
+						trDurations, _ := prToTaskDurations[key]
+						podDurations, _ := prToPodDurations[key]
+						fmt.Fprintf(os.Stdout, "PipelineRun %s\t\ttook %v seconds with taskruns %v delta %v percent %f and pods %v delta %v percent %f\n", key, value, trDurations, value-trDurations, trDurations/value, podDurations, value-podDurations, podDurations/value)
+					}
+				}
+			}
+
+		},
+	}
+	return allList
 }
