@@ -37,6 +37,8 @@ var trStartTimes = map[string]time.Time{}
 var trEndTimes = map[string]time.Time{}
 var podStartTimes = map[string]time.Time{}
 var podEndTimes = map[string]time.Time{}
+var containerStartTimes = map[string]time.Time{}
+var containerEndTimmes = map[string]time.Time{}
 
 var prToDuration = map[string]float64{}
 var prDurations = []float64{}
@@ -47,6 +49,11 @@ var podDurationsMap = map[float64]struct{}{}
 var trToDuration = map[string]float64{}
 var trDurations = []float64{}
 var trDurationsMap = map[float64]struct{}{}
+var containerToDuration = map[string]float64{}
+var containerDurations = []float64{}
+var containerDurationsMap = map[float64]struct{}{}
+
+var containerOnly bool
 
 func ignorePipelineRun(pr *v1beta1.PipelineRun, prFilter string) bool {
 	prKey := fmt.Sprintf("%s:%s", pr.Namespace, pr.Name)
@@ -155,6 +162,49 @@ func processPod(pod *corev1.Pod) time.Duration {
 	return duration
 }
 
+func processContainers(pod *corev1.Pod) []time.Duration {
+	durations := []time.Duration{}
+	specNameToIndex := map[string]int{}
+	statusNameToIndex := map[string]int{}
+	for index, container := range pod.Spec.Containers {
+		specNameToIndex[container.Name] = index
+	}
+	for index, cstatus := range pod.Status.ContainerStatuses {
+		statusNameToIndex[cstatus.Name] = index
+	}
+	for _, cstatus := range pod.Status.ContainerStatuses {
+		terminated := cstatus.State.Terminated
+		if terminated == nil {
+			continue
+		}
+		// containers are created started concurrently, but k8s/linux "pauses" then "resumes" per spec order
+		// so we take that finish time of the prior container if not the first container
+		started := terminated.StartedAt.Time
+		specIndex, _ := specNameToIndex[cstatus.Name]
+		if specIndex != 0 {
+			// not first container, get prior container finish time
+			priorContainerName := pod.Spec.Containers[specIndex-1].Name
+			priorContainerStatusIndex, _ := statusNameToIndex[priorContainerName]
+			priorContainerStatus := pod.Status.ContainerStatuses[priorContainerStatusIndex]
+			if priorContainerStatus.State.Terminated != nil {
+				started = priorContainerStatus.State.Terminated.FinishedAt.Time
+			}
+		}
+		finished := terminated.FinishedAt.Time
+		duration := finished.Sub(started)
+		ckey := fmt.Sprintf("%s:%s-%s", pod.Namespace, pod.Name, cstatus.Name)
+		containerToDuration[ckey] = duration.Seconds()
+		containerStartTimes[ckey] = started
+		containerEndTimmes[ckey] = finished
+		_, ok := containerDurationsMap[duration.Seconds()]
+		if !ok {
+			containerDurations = append(containerDurations, duration.Seconds())
+			containerDurationsMap[duration.Seconds()] = struct{}{}
+		}
+	}
+	return durations
+}
+
 func determinePRConcurrency(prKey string) int {
 	return innerConcurrency(prKey, prStartTimes, prEndTimes)
 }
@@ -165,6 +215,10 @@ func determineTRConcurrency(trKey string) int {
 
 func determinePodConcurrency(prKey string) int {
 	return innerConcurrency(prKey, podStartTimes, podEndTimes)
+}
+
+func determineContainerConcurrency(ckey string) int {
+	return innerConcurrency(ckey, containerStartTimes, containerEndTimmes)
 }
 
 func innerConcurrency(key string, starts map[string]time.Time, ends map[string]time.Time) int {
@@ -265,18 +319,36 @@ func parsePodList(fileName, prFilter string) ([]string, []float64, []int, bool) 
 			continue
 		}
 
-		processPod(&pod)
+		if !containerOnly {
+			processPod(&pod)
+		} else {
+			processContainers(&pod)
+		}
 	}
-	sort.Float64s(podDurations)
 	retS := []string{}
 	retF := []float64{}
 	retI := []int{}
-	for _, duration := range podDurations {
-		for key, value := range podToDuration {
-			if value == duration {
-				retS = append(retS, key)
-				retF = append(retF, value)
-				retI = append(retI, determinePodConcurrency(key))
+	if !containerOnly {
+		sort.Float64s(podDurations)
+		for _, duration := range podDurations {
+			for key, value := range podToDuration {
+				if value == duration {
+					retS = append(retS, key)
+					retF = append(retF, value)
+					retI = append(retI, determinePodConcurrency(key))
+				}
+			}
+		}
+	}
+	if containerOnly {
+		sort.Float64s(containerDurations)
+		for _, duration := range containerDurations {
+			for key, value := range containerToDuration {
+				if value == duration {
+					retS = append(retS, key)
+					retF = append(retF, value)
+					retI = append(retI, determineContainerConcurrency(key))
+				}
 			}
 		}
 	}
@@ -284,11 +356,19 @@ func parsePodList(fileName, prFilter string) ([]string, []float64, []int, bool) 
 }
 
 func ParsePodList() *cobra.Command {
-	parseTRList := &cobra.Command{
+	parsePodListCmd := &cobra.Command{
 		Use:   "podlist <file location> [<options>]",
 		Short: "Parse a list of Pods for various statistics",
 		Long:  "Parse a list of Pods for various statistics",
 		Example: `
+# Print just the pods
+$ tapa podlist <pod list json/yaml file>
+
+# Print just the containers
+$ tapa podlist <pod list json/yaml file> --containers-only
+
+# Print containers and pods
+$ tapa podlist <pod list json/yaml file> --containers-and-pods
 `,
 		Run: func(cmd *cobra.Command, args []string) {
 			if len(args) == 0 {
@@ -310,7 +390,9 @@ func ParsePodList() *cobra.Command {
 			}
 		},
 	}
-	return parseTRList
+	parsePodListCmd.Flags().BoolVar(&containerOnly, "containers-only", containerOnly,
+		"Only list containers and not pods")
+	return parsePodListCmd
 }
 
 func parseTaskRunList(fileName, prFilter string) ([]string, []float64, []int, bool) {
