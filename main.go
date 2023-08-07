@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"github.com/spf13/cobra"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	"io/fs"
 	corev1 "k8s.io/api/core/v1"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -55,6 +57,117 @@ var containerDurationsMap = map[float64]struct{}{}
 
 var containerOnly bool
 
+func processPRFiles(fileName string) (*v1beta1.PipelineRunList, error) {
+	var err error
+	prList := &v1beta1.PipelineRunList{}
+	prList.Items = []v1beta1.PipelineRun{}
+
+	err = filepath.Walk(fileName, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "filepath walk error: %s\n", err.Error())
+			return nil
+		}
+		if !info.IsDir() {
+			buf, e := os.ReadFile(path)
+			if e != nil {
+				fmt.Fprintf(os.Stderr, "problem reading %s: %s\n", path, e.Error())
+				return nil
+			}
+			prl := &v1beta1.PipelineRunList{}
+			e = json.Unmarshal(buf, prl)
+			if e != nil {
+				return nil
+			}
+			if len(prl.Items) > 0 {
+				// unmarshall is not a perfect type filter
+				for _, pr := range prl.Items {
+					if pr.Kind != "PipelineRun" {
+						continue
+					}
+					prList.Items = append(prList.Items, pr)
+				}
+
+			}
+		}
+		return nil
+	})
+
+	return prList, err
+}
+
+func processTRFiles(fileName string) (*v1beta1.TaskRunList, error) {
+	var err error
+	trList := &v1beta1.TaskRunList{}
+	trList.Items = []v1beta1.TaskRun{}
+
+	err = filepath.Walk(fileName, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "filepath walk error: %s\n", err.Error())
+			return nil
+		}
+		if !info.IsDir() {
+			buf, e := os.ReadFile(path)
+			if e != nil {
+				fmt.Fprintf(os.Stderr, "problem reading %s: %s\n", path, e.Error())
+				return nil
+			}
+			trl := &v1beta1.TaskRunList{}
+			e = json.Unmarshal(buf, trl)
+			if e != nil {
+				return nil
+			}
+			if len(trl.Items) > 0 {
+				// unmarshall is not a perfect type filter
+				for _, tr := range trl.Items {
+					if tr.Kind != "TaskRun" {
+						continue
+					}
+					trList.Items = append(trList.Items, tr)
+				}
+			}
+		}
+		return nil
+	})
+
+	return trList, err
+}
+
+func processPodFiles(fileName string) (*corev1.PodList, error) {
+	var err error
+	podList := &corev1.PodList{}
+	podList.Items = []corev1.Pod{}
+
+	err = filepath.Walk(fileName, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "filepath walk error: %s\n", err.Error())
+			return nil
+		}
+		if !info.IsDir() {
+			buf, e := os.ReadFile(path)
+			if e != nil {
+				fmt.Fprintf(os.Stderr, "problem reading %s: %s\n", path, e.Error())
+				return nil
+			}
+			pl := &corev1.PodList{}
+			e = json.Unmarshal(buf, pl)
+			if e != nil {
+				return nil
+			}
+			if len(pl.Items) > 0 {
+				for _, pod := range pl.Items {
+					if pod.Kind != "Pod" {
+						continue
+					}
+					podList.Items = append(podList.Items, pod)
+				}
+			}
+		}
+		return nil
+	})
+
+	return podList, err
+}
+
 func ignorePipelineRun(pr *v1beta1.PipelineRun, prFilter string) bool {
 	prKey := fmt.Sprintf("%s:%s", pr.Namespace, pr.Name)
 	if len(prFilter) > 0 && prKey != prFilter {
@@ -81,16 +194,6 @@ func ignoreTaskRun(tr *v1beta1.TaskRun, prFilter string) bool {
 		return true
 	}
 	return false
-}
-
-func prOwns(kidns, kidname, prns, prname string) bool {
-	if kidns != prns {
-		return false
-	}
-	if !strings.HasPrefix(kidname, prname) {
-		return false
-	}
-	return true
 }
 
 func ignorePod(pod *corev1.Pod, prFilter string) bool {
@@ -242,14 +345,9 @@ func innerConcurrency(key string, starts map[string]time.Time, ends map[string]t
 }
 
 func parsePipelineRunList(fileName, prFilter string) ([]string, []float64, []int, bool) {
-	buf, err := os.ReadFile(fileName)
+	prList, err := processPRFiles(fileName)
 	if err != nil {
 		return []string{fmt.Sprintf("ERROR: problem reading file %s: %s\n", fileName, err.Error())}, nil, nil, false
-	}
-	prList := &v1beta1.PipelineRunList{}
-	err = json.Unmarshal(buf, prList)
-	if err != nil {
-		return []string{fmt.Sprintf("ERROR: file %s not marshalling into a PipelineRun list: %s\n", fileName, err.Error())}, nil, nil, false
 	}
 
 	for _, pr := range prList.Items {
@@ -304,12 +402,7 @@ func ParsePipelineRunList() *cobra.Command {
 }
 
 func parsePodList(fileName, prFilter string) ([]string, []float64, []int, bool) {
-	buf, err := os.ReadFile(fileName)
-	if err != nil {
-		return []string{fmt.Sprintf("ERROR: problem reading file %s: %s\n", fileName, err.Error())}, nil, nil, false
-	}
-	podList := &corev1.PodList{}
-	err = json.Unmarshal(buf, podList)
+	podList, err := processPodFiles(fileName)
 	if err != nil {
 		return []string{fmt.Sprintf("ERROR: file %s not marshalling into a Pod list: %s\n", fileName, err.Error())}, nil, nil, false
 	}
@@ -366,9 +459,6 @@ $ tapa podlist <pod list json/yaml file>
 
 # Print just the containers
 $ tapa podlist <pod list json/yaml file> --containers-only
-
-# Print containers and pods
-$ tapa podlist <pod list json/yaml file> --containers-and-pods
 `,
 		Run: func(cmd *cobra.Command, args []string) {
 			if len(args) == 0 {
@@ -396,12 +486,7 @@ $ tapa podlist <pod list json/yaml file> --containers-and-pods
 }
 
 func parseTaskRunList(fileName, prFilter string) ([]string, []float64, []int, bool) {
-	buf, err := os.ReadFile(fileName)
-	if err != nil {
-		return []string{fmt.Sprintf("ERROR: problem reading file %s: %s\n", fileName, err.Error())}, nil, nil, false
-	}
-	trList := &v1beta1.TaskRunList{}
-	err = json.Unmarshal(buf, trList)
+	trList, err := processTRFiles(fileName)
 	if err != nil {
 		return []string{fmt.Sprintf("ERROR: file %s not marshalling into a TaskRun list: %s\n", fileName, err.Error())}, nil, nil, false
 	}
