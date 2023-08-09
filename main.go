@@ -565,13 +565,27 @@ func ParseAllThreeLists() *cobra.Command {
 		Example: `
 `,
 		Run: func(cmd *cobra.Command, args []string) {
-			if len(args) < 3 {
+			if len(args) < 1 {
 				fmt.Fprintf(os.Stderr, "ERROR: not enough arguments: %s\n", cmd.Use)
 				return
 			}
-			prFileName := args[0]
-			trFileName := args[1]
-			podFileName := args[2]
+			fileStat, err := os.Stat(args[0])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: could not analyze file %s: %s\n", args[0], err.Error())
+				return
+			}
+			if len(args) < 3 && !fileStat.IsDir() {
+				fmt.Fprintf(os.Stderr, "ERROR: not enough arguments: %s\n", cmd.Use)
+				return
+			}
+			var prFileName, trFileName, podFileName string
+			if !fileStat.IsDir() {
+				prFileName = args[0]
+				trFileName = args[1]
+				podFileName = args[2]
+			} else {
+				prFileName, trFileName, podFileName = args[0], args[0], args[0]
+			}
 
 			retS1, retF1, retI1, ok1 := parsePipelineRunList(prFileName, "")
 			if !ok1 {
