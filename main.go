@@ -3,15 +3,16 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/spf13/cobra"
-	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	"io/fs"
-	corev1 "k8s.io/api/core/v1"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func main() {
@@ -23,10 +24,20 @@ func main() {
 			cmd.Help()
 		},
 	}
+	tapa.PersistentFlags().StringVarP(&outputType, "output-type", "t", OutputTypeText, "output type, one of: text, csv")
+	tapa.ParseFlags(os.Args)
+
 	tapa.AddCommand(ParsePipelineRunList())
 	tapa.AddCommand(ParseTaskRunList())
 	tapa.AddCommand(ParsePodList())
 	tapa.AddCommand(ParseAllThreeLists())
+
+	if outputType != OutputTypeText && outputType != OutputTypeCsv {
+		tapa.Help()
+		fmt.Fprintf(os.Stderr, "Error: Invalid value for output-type: %s\n", outputType)
+		os.Exit(1)
+	}
+
 	if err := tapa.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "tapa encountered the following error: %s\n", err.Error())
 		os.Exit(1)
@@ -55,7 +66,15 @@ var containerToDuration = map[string]float64{}
 var containerDurations = []float64{}
 var containerDurationsMap = map[float64]struct{}{}
 
-var containerOnly bool
+const (
+	OutputTypeText string = "text"
+	OutputTypeCsv  string = "csv"
+)
+
+var (
+	outputType    string = OutputTypeText
+	containerOnly bool   = false
+)
 
 func processPRFiles(fileName string) (*v1beta1.PipelineRunList, error) {
 	var err error
@@ -393,9 +412,7 @@ func ParsePipelineRunList() *cobra.Command {
 					fmt.Fprintf(w, str)
 				}
 			}
-			for i, key := range retS {
-				fmt.Fprintf(w, "PipelineRun %s\t\ttook %v seconds with concurrency at %d\n", key, retF[i], retI[i])
-			}
+			printList("PipelineRun", retS, retF, retI)
 		},
 	}
 	return parsePRList
@@ -475,9 +492,7 @@ $ tapa podlist <pod list json/yaml file> --containers-only
 				}
 				return
 			}
-			for i, key := range retS {
-				fmt.Fprintf(w, "Pod %s\t\ttook %v seconds concurrency %d\n", key, retF[i], retI[i])
-			}
+			printList("Pod", retS, retF, retI)
 		},
 	}
 	parsePodListCmd.Flags().BoolVar(&containerOnly, "containers-only", containerOnly,
@@ -536,9 +551,7 @@ func ParseTaskRunList() *cobra.Command {
 				}
 				return
 			}
-			for i, key := range retS {
-				fmt.Fprintf(w, "TaskRun %s\t\ttook %v seconds concurrency %d\n", key, retF[i], retI[i])
-			}
+			printList("TaskRun", retS, retF, retI)
 		},
 	}
 	return parseTRList
@@ -581,7 +594,7 @@ func ParseAllThreeLists() *cobra.Command {
 				}
 				return
 			}
-
+			printHeader("PipelineRun", "Duration", "Concurrency", "TaskRunsDuration", "TaskRunsDelta", "TaskRunsPercentage", "TaskRunsMaxConcurrency", "PodsDuration", "PodsDelta", "PodsPercentage", "PodsMaxConcurrency")
 			for i, prkey := range retS1 {
 				prDuration := retF1[i]
 				prConcurency := retI1[i]
@@ -609,8 +622,7 @@ func ParseAllThreeLists() *cobra.Command {
 						maxPodConcurrency = retI3[iii]
 					}
 				}
-
-				fmt.Fprintf(os.Stdout, "PipelineRun %s\t\t took %v seconds with pr concurrency %d with taskruns %v seconds delta %v percent %f taskrun max concurrency %d pods %v seconds delta %v percent %f pod max concurrency %d\n",
+				printLine("PipelineRun %s\t\t took %v seconds with pr concurrency %d with taskruns %v seconds delta %v percent %f taskrun max concurrency %d pods %v seconds delta %v percent %f pod max concurrency %d\n",
 					prkey,
 					prDuration,
 					prConcurency,
@@ -627,4 +639,46 @@ func ParseAllThreeLists() *cobra.Command {
 		},
 	}
 	return allList
+}
+
+func printHeader(headers ...string) {
+	out := ""
+	switch outputType {
+	case OutputTypeCsv:
+		for _, h := range headers {
+			if len(out) > 0 {
+				out += fmt.Sprintf(";%s", h)
+			} else {
+				out = h
+			}
+		}
+		fmt.Fprintln(os.Stdout, out)
+	default:
+		// text output does not have a header, do not print anything
+	}
+}
+
+func printLine(format string, values ...any) {
+	w := os.Stdout
+	out := ""
+	switch outputType {
+	case OutputTypeCsv:
+		for _, v := range values {
+			if len(out) > 0 {
+				out += fmt.Sprintf(";%v", v)
+			} else {
+				out = fmt.Sprintf("%v", v)
+			}
+		}
+		fmt.Fprintln(w, out)
+	default:
+		fmt.Fprintf(w, format, values...)
+	}
+}
+
+func printList(resource string, keys []string, durations []float64, concurencies []int) {
+	printHeader(resource, "Duration", "Concurrency")
+	for i, key := range keys {
+		printLine(fmt.Sprintf("%s %%s\t\ttook %%v seconds concurrency %%d\n", resource), key, durations[i], concurencies[i])
+	}
 }
