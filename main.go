@@ -393,7 +393,7 @@ func parsePipelineRunList(fileName, prFilter string) ([]string, []float64, []int
 
 func ParsePipelineRunList() *cobra.Command {
 	parsePRList := &cobra.Command{
-		Use:   "prlist <file location> [<options>]",
+		Use:   "prlist <file location or directory tree with files> [<options>]",
 		Short: "Parse a list of Tekton PipelineRuns for various statistics",
 		Long:  "Parse a list of Tekton PipelineRuns for various statistics",
 		Example: `
@@ -467,15 +467,15 @@ func parsePodList(fileName, prFilter string) ([]string, []float64, []int, bool) 
 
 func ParsePodList() *cobra.Command {
 	parsePodListCmd := &cobra.Command{
-		Use:   "podlist <file location> [<options>]",
+		Use:   "podlist <file location or directory tree with files> [<options>]",
 		Short: "Parse a list of Pods for various statistics",
 		Long:  "Parse a list of Pods for various statistics",
 		Example: `
 # Print just the pods
-$ tapa podlist <pod list json/yaml file>
+$ tapa podlist <pod list json/yaml file or directory with files>
 
 # Print just the containers
-$ tapa podlist <pod list json/yaml file> --containers-only
+$ tapa podlist <pod list json/yaml file or directory with files> --containers-only
 `,
 		Run: func(cmd *cobra.Command, args []string) {
 			if len(args) == 0 {
@@ -531,7 +531,7 @@ func parseTaskRunList(fileName, prFilter string) ([]string, []float64, []int, bo
 
 func ParseTaskRunList() *cobra.Command {
 	parseTRList := &cobra.Command{
-		Use:   "trlist <file location> [<options>]",
+		Use:   "trlist <file location or directory tree with files> [<options>]",
 		Short: "Parse a list of TaskRun for various statistics",
 		Long:  "Parse a list of TaskRun for various statistics",
 		Example: `
