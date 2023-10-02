@@ -1,18 +1,18 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
+	"github.com/spf13/cobra"
+	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	"io/fs"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes/scheme"
+	"knative.dev/pkg/apis"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/spf13/cobra"
-	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
-	corev1 "k8s.io/api/core/v1"
 )
 
 func main() {
@@ -72,14 +72,17 @@ const (
 )
 
 var (
-	outputType    string = OutputTypeText
-	containerOnly bool   = false
+	outputType    = OutputTypeText
+	containerOnly = false
+	whoFailed     = false
 )
 
 func processPRFiles(fileName string) (*v1beta1.PipelineRunList, error) {
 	var err error
 	prList := &v1beta1.PipelineRunList{}
 	prList.Items = []v1beta1.PipelineRun{}
+	v1beta1.AddToScheme(scheme.Scheme)
+	decoder := scheme.Codecs.UniversalDecoder()
 
 	err = filepath.Walk(fileName, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
@@ -93,8 +96,10 @@ func processPRFiles(fileName string) (*v1beta1.PipelineRunList, error) {
 				return nil
 			}
 			prl := &v1beta1.PipelineRunList{}
-			e = json.Unmarshal(buf, prl)
-			if e != nil {
+			_, _, e1 := decoder.Decode(buf, nil, prl)
+			pipelineRun := &v1beta1.PipelineRun{}
+			_, _, e2 := decoder.Decode(buf, nil, pipelineRun)
+			if e1 != nil && e2 != nil {
 				return nil
 			}
 			if len(prl.Items) > 0 {
@@ -105,7 +110,8 @@ func processPRFiles(fileName string) (*v1beta1.PipelineRunList, error) {
 					}
 					prList.Items = append(prList.Items, pr)
 				}
-
+			} else {
+				prList.Items = append(prList.Items, *pipelineRun)
 			}
 		}
 		return nil
@@ -118,6 +124,8 @@ func processTRFiles(fileName string) (*v1beta1.TaskRunList, error) {
 	var err error
 	trList := &v1beta1.TaskRunList{}
 	trList.Items = []v1beta1.TaskRun{}
+	v1beta1.AddToScheme(scheme.Scheme)
+	decoder := scheme.Codecs.UniversalDecoder()
 
 	err = filepath.Walk(fileName, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
@@ -131,8 +139,10 @@ func processTRFiles(fileName string) (*v1beta1.TaskRunList, error) {
 				return nil
 			}
 			trl := &v1beta1.TaskRunList{}
-			e = json.Unmarshal(buf, trl)
-			if e != nil {
+			_, _, e1 := decoder.Decode(buf, nil, trl)
+			taskRun := &v1beta1.TaskRun{}
+			_, _, e2 := decoder.Decode(buf, nil, taskRun)
+			if e1 != nil && e2 != nil {
 				return nil
 			}
 			if len(trl.Items) > 0 {
@@ -143,6 +153,8 @@ func processTRFiles(fileName string) (*v1beta1.TaskRunList, error) {
 					}
 					trList.Items = append(trList.Items, tr)
 				}
+			} else {
+				trList.Items = append(trList.Items, *taskRun)
 			}
 		}
 		return nil
@@ -155,6 +167,8 @@ func processPodFiles(fileName string) (*corev1.PodList, error) {
 	var err error
 	podList := &corev1.PodList{}
 	podList.Items = []corev1.Pod{}
+	corev1.AddToScheme(scheme.Scheme)
+	decoder := scheme.Codecs.UniversalDecoder()
 
 	err = filepath.Walk(fileName, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
@@ -168,8 +182,10 @@ func processPodFiles(fileName string) (*corev1.PodList, error) {
 				return nil
 			}
 			pl := &corev1.PodList{}
-			e = json.Unmarshal(buf, pl)
-			if e != nil {
+			_, _, e1 := decoder.Decode(buf, nil, pl)
+			p := &corev1.Pod{}
+			_, _, e2 := decoder.Decode(buf, nil, p)
+			if e1 != nil && e2 != nil {
 				return nil
 			}
 			if len(pl.Items) > 0 {
@@ -179,6 +195,8 @@ func processPodFiles(fileName string) (*corev1.PodList, error) {
 					}
 					podList.Items = append(podList.Items, pod)
 				}
+			} else {
+				podList.Items = append(podList.Items, *p)
 			}
 		}
 		return nil
@@ -363,6 +381,64 @@ func innerConcurrency(key string, starts map[string]time.Time, ends map[string]t
 	return total
 }
 
+func findFailedPipelineRns(fileName, prFilter string) ([]string, []string) {
+	nslist := []string{}
+	namelist := []string{}
+	prList, err := processPRFiles(fileName)
+	if err != nil {
+		return []string{fmt.Sprintf("ERROR: problem reading file %s: %s\n", fileName, err.Error())}, nil
+	}
+
+	for _, pr := range prList.Items {
+		if ignorePipelineRun(&pr, prFilter) {
+			continue
+		}
+		if !pr.IsDone() {
+			fmt.Fprintf(os.Stderr, "PipelineRun %s:%s is not done\n", pr.Namespace, pr.Name)
+			continue
+		}
+		succeedCondition := pr.Status.GetCondition(apis.ConditionSucceeded)
+		// IsDone guarantees that the success condition is not nil
+		if succeedCondition.IsFalse() {
+			fmt.Fprintf(os.Stdout, "PipelineRun %s:%s failed\n", pr.Namespace, pr.Name)
+			nslist = append(nslist, pr.Namespace)
+			namelist = append(namelist, pr.Name)
+		}
+	}
+	return nslist, namelist
+}
+
+func findPodLogsForPipelineRun(ns, name, fileName string) error {
+	err := filepath.Walk(fileName, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "filepath walk error: %s\n", err.Error())
+			return nil
+		}
+		if !info.IsDir() {
+			if !strings.HasSuffix(path, ".log") {
+				return nil
+			}
+			if !strings.Contains(path, ns) {
+				return nil
+			}
+			if !strings.Contains(path, name) {
+				return nil
+			}
+			buf, e := os.ReadFile(path)
+			if e != nil {
+				fmt.Fprintf(os.Stderr, "problem reading %s: %s\n", path, e.Error())
+				return nil
+			}
+			fmt.Fprintf(os.Stdout, "PipelineRun %s:%s pod file %s has contents:\n %s\n", ns, name, info.Name(), string(buf))
+		}
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error finding pod logs: %s\n", err.Error())
+	}
+	return err
+}
+
 func parsePipelineRunList(fileName, prFilter string) ([]string, []float64, []int, bool) {
 	prList, err := processPRFiles(fileName)
 	if err != nil {
@@ -397,6 +473,11 @@ func ParsePipelineRunList() *cobra.Command {
 		Short: "Parse a list of Tekton PipelineRuns for various statistics",
 		Long:  "Parse a list of Tekton PipelineRuns for various statistics",
 		Example: `
+# Print the runtime stats
+$ tapa prlist <pipelinerun list json/yaml files or directory with files>
+
+# Print the pipelineruns that failed
+$ tapa prlist <pipelinerun list json/yaml files or directory with files> --who-failed
 `,
 		Run: func(cmd *cobra.Command, args []string) {
 			if len(args) == 0 {
@@ -404,6 +485,14 @@ func ParsePipelineRunList() *cobra.Command {
 				return
 			}
 			fileName := args[0]
+			if whoFailed {
+				prns, prname := findFailedPipelineRns(fileName, "")
+				for i, ns := range prns {
+					name := prname[i]
+					findPodLogsForPipelineRun(ns, name, fileName)
+				}
+				return
+			}
 			retS, retF, retI, ok := parsePipelineRunList(fileName, "")
 			w := os.Stdout
 			if !ok {
@@ -415,6 +504,8 @@ func ParsePipelineRunList() *cobra.Command {
 			printList("PipelineRun", retS, retF, retI)
 		},
 	}
+	parsePRList.Flags().BoolVar(&whoFailed, "who-failed", whoFailed,
+		"Only list pipelineruns that failed")
 	return parsePRList
 }
 
